@@ -27,6 +27,11 @@ void prompt_init(void)
     }
 }
 
+const char *prompt_home_dir(void)
+{
+    return home_dir;
+}
+
 /*
  * Writes the display path for the current working directory into out
  * (a buffer of size out_size), substituting the shell's home
