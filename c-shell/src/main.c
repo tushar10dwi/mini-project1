@@ -4,6 +4,7 @@
 #include "parser.h"
 #include "token.h"
 #include "hop.h"
+#include "reveal.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -76,6 +77,9 @@ int main(void)
 
             if (strcmp(argv[0], "hop") == 0) {
                 hop_execute(argc, argv);
+            }
+            else if (strcmp(argv[0], "reveal") == 0) {
+                reveal_execute(argc, argv);
             }
         }
 

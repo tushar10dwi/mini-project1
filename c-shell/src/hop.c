@@ -313,3 +313,8 @@ int hop_execute(int argc, char **argv)
 
     return 0;
 }
+
+const char *hop_get_prev_dir(void)
+{
+    return prev_cwd;
+}

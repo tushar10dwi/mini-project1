@@ -29,5 +29,6 @@ void hop_save(void);
  * stdout, and remaining arguments are not processed).
  */
 int hop_execute(int argc, char **argv);
+const char *hop_get_prev_dir(void);
 
 #endif /* HOP_H */
