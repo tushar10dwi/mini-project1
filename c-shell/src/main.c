@@ -5,6 +5,7 @@
 #include "token.h"
 #include "hop.h"
 #include "reveal.h"
+#include "peek.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -80,6 +81,9 @@ int main(void)
             }
             else if (strcmp(argv[0], "reveal") == 0) {
                 reveal_execute(argc, argv);
+            }
+            else if (strcmp(argv[0], "peek") == 0) {
+                peek_execute(argc, argv);
             }
         }
 
