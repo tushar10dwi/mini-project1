@@ -13,16 +13,6 @@
 
 #define MAX_ARGS 64
 
-/*
- * Builds argv from the leading run of TOK_WORD tokens (stopping at the
- * first operator or end of list). This is a stand-in for the full
- * command dispatcher (pipes, redirection, backgrounding, external
- * commands) that later parts will add; for now it's just enough to
- * route a single simple command like "hop a b" to its builtin.
- *
- * Returns argc. argv[i] points into the tokens' owned strings, so it
- * is only valid until the token list is freed.
- */
 static int build_argv(const token_t *tokens, char **argv, int max_args)
 {
     int argc = 0;
@@ -33,6 +23,32 @@ static int build_argv(const token_t *tokens, char **argv, int max_args)
         t = t->next;
     }
 
+    return argc;
+}
+
+static int build_exec_argv(const token_t *tokens, char **argv, int max_args)
+{
+    int argc = 0;
+
+    for (const token_t *t = tokens;
+         t != NULL && argc < max_args - 1;
+         t = t->next) {
+
+        if (t->type == TOK_WORD) {
+            argv[argc++] = t->value;
+        }
+        else if (t->type == TOK_LT) {
+            argv[argc++] = "<";
+        }
+        else if (t->type == TOK_GT) {
+            argv[argc++] = ">";
+        }
+        else if (t->type == TOK_GTGT) {
+            argv[argc++] = ">>";
+        }
+    }
+
+    argv[argc] = NULL;
     return argc;
 }
 
@@ -47,13 +63,10 @@ int main(void)
         prompt_print();
 
         if (!read_input(line, sizeof(line))) {
-            /* EOF (e.g. Ctrl-D) or a read error: exit the shell. */
             putchar('\n');
             break;
         }
 
-        /* Part A only handles reading input and re-prompting.
-         * Parsing and execution are added in later parts. */
         if (strcmp(line, "exit") == 0) {
             break;
         }
@@ -70,14 +83,10 @@ int main(void)
             continue;
         }
  
-        /* Line is syntactically valid (or empty/whitespace-only).
-         * Full command execution (pipes, redirection, external
-         * commands) is added in a later part; for now, route simple
-         * builtins like hop directly. */
         if (tokens != NULL && tokens->type == TOK_WORD) {
             char *argv[MAX_ARGS];
             int argc = build_argv(tokens, argv, MAX_ARGS);
-
+            
             if (strcmp(argv[0], "hop") == 0) {
                 hop_execute(argc, argv);
             }
@@ -91,7 +100,9 @@ int main(void)
                 locate_execute(argc, argv);
             }
             else {
-                exec_command(argc, argv);
+                char *exec_argv[MAX_ARGS];
+                int exec_argc = build_exec_argv(tokens, exec_argv, MAX_ARGS);
+                exec_command(exec_argc, exec_argv);
             }
         }
 
