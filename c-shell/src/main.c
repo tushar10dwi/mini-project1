@@ -7,6 +7,7 @@
 #include "reveal.h"
 #include "peek.h"
 #include "locate.h"
+#include "exec.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -88,6 +89,9 @@ int main(void)
             }
             else if (strcmp(argv[0], "locate") == 0) {
                 locate_execute(argc, argv);
+            }
+            else {
+                exec_command(argc, argv);
             }
         }
 
