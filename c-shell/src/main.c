@@ -9,6 +9,7 @@
 #include "locate.h"
 #include "exec.h"
 #include "pipeline.h"
+#include "sequence.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -53,6 +54,55 @@ static int build_exec_argv(const token_t *tokens, char **argv, int max_args)
     return argc;
 }
 
+/* Decides how to run one ';'-delimited segment: if it contains a '|' it's
+ * a pipeline, otherwise it's dispatched as a single builtin or external
+ * command -- the same logic main() used to apply to the whole line before
+ * sequencing was introduced. Passed to sequence_execute() as the callback
+ * it uses per segment. */
+static int run_segment(const token_t *seg)
+{
+    if (seg == NULL) {
+        /* empty segment, e.g. from "cmd1;;cmd2" or a stray leading ';' */
+        return 0;
+    }
+
+    for (const token_t *t = seg; t != NULL; t = t->next) {
+        if (t->type == TOK_PIPE) {
+            return pipeline_execute(seg);
+        }
+    }
+
+    if (seg->type != TOK_WORD) {
+        return 0;
+    }
+
+    char *argv[MAX_ARGS];
+    int argc = build_argv(seg, argv, MAX_ARGS);
+    if (argc == 0) {
+        return 0;
+    }
+
+    if (strcmp(argv[0], "hop") == 0) {
+        hop_execute(argc, argv);
+    }
+    else if (strcmp(argv[0], "reveal") == 0) {
+        reveal_execute(argc, argv);
+    }
+    else if (strcmp(argv[0], "peek") == 0) {
+        peek_execute(argc, argv);
+    }
+    else if (strcmp(argv[0], "locate") == 0) {
+        locate_execute(argc, argv);
+    }
+    else {
+        char *exec_argv[MAX_ARGS];
+        int exec_argc = build_exec_argv(seg, exec_argv, MAX_ARGS);
+        return exec_command(exec_argc, exec_argv);
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     char line[INPUT_MAX_LEN + 1];
@@ -85,39 +135,12 @@ int main(void)
         }
 
         if (tokens != NULL) {
-            int is_pipeline = 0;
-            for (const token_t *t = tokens; t != NULL; t = t->next) {
-                if (t->type == TOK_PIPE) { // Ensure TOK_PIPE is declared in your lexer
-                    is_pipeline = 1;
-                    break;
-                }
-            }
- 
-            if (is_pipeline) {
-                pipeline_execute(tokens);
-            }
-            else if (tokens->type == TOK_WORD) {
-                char *argv[MAX_ARGS];
-                int argc = build_argv(tokens, argv, MAX_ARGS);
-                
-                if (strcmp(argv[0], "hop") == 0) {
-                    hop_execute(argc, argv);
-                }
-                else if (strcmp(argv[0], "reveal") == 0) {
-                    reveal_execute(argc, argv);
-                }
-                else if (strcmp(argv[0], "peek") == 0) {
-                    peek_execute(argc, argv);
-                }
-                else if (strcmp(argv[0], "locate") == 0) {
-                    locate_execute(argc, argv);
-                }
-                else {
-                    char *exec_argv[MAX_ARGS];
-                    int exec_argc = build_exec_argv(tokens, exec_argv, MAX_ARGS);
-                    exec_command(exec_argc, exec_argv);
-                }
-            }
+            /* sequence_execute() splits on ';' and calls run_segment() for
+             * each piece, in order -- run_segment() then decides whether
+             * that piece is a pipeline ('|') or a single command. Together
+             * this covers a plain command, a pipeline, a sequence, or any
+             * mix of the two (e.g. "cmd1 | cmd2 ; cmd3 ; cmd4 | cmd5"). */
+            sequence_execute(tokens, run_segment);
 
             token_list_free(&tokens);
         }
