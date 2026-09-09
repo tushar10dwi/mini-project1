@@ -2,6 +2,19 @@
 #define SEQUENCE_H
 
 #include "token.h"
+#include "pipeline.h"
+#include "exec.h"
+#include "hop.h"
+#include "reveal.h"
+#include "peek.h"
+#include "locate.h"
+#include "jobs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <string.h>
 
 /*
  * Runs one ';'-delimited segment (a sub-list of tokens containing no
@@ -9,7 +22,7 @@
  * caller of sequence_execute() so that sequence.c stays agnostic to what
  * a segment actually is (a single command, a pipeline, etc).
  */
-typedef int (*segment_executor_t)(const token_t *segment);
+typedef int (*segment_executor_t)(const token_t *segment, int background);
 
 /*
  * Splits a token list on ';' (TOK_SEMI) into segments and runs each one,
@@ -26,6 +39,7 @@ typedef int (*segment_executor_t)(const token_t *segment);
  *
  * Returns the exit status of the last segment that was executed.
  */
-int sequence_execute(const token_t *tokens, segment_executor_t run_segment);
 
+
+int sequence_execute(const token_t *tokens, segment_executor_t run_segment);
 #endif /* SEQUENCE_H */

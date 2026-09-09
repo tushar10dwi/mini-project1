@@ -4,16 +4,18 @@
 #include "reveal.h"
 #include "peek.h"
 #include "locate.h"
+#include "jobs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <string.h>
 
 #define MAX_CMDS 64
 #define MAX_ARGS 64
 
-int pipeline_execute(const token_t *tokens)
+int pipeline_execute(const token_t *tokens, int background)
 {
     char *cmd_argv[MAX_CMDS][MAX_ARGS];
     int cmd_argc[MAX_CMDS] = {0};
@@ -45,6 +47,10 @@ int pipeline_execute(const token_t *tokens)
     cmd_argv[num_cmds][cmd_argc[num_cmds]] = NULL;
     num_cmds++;
 
+    // If backgrounded, capture the pipeline's text now (before forking)
+    // for the eventual "<cmdline> with pid <pid> exited ..." message.
+    char *cmdline = background ? jobs_stringify_tokens(tokens) : NULL;
+
     int pipes[MAX_CMDS][2];
     pid_t pids[MAX_CMDS];
 
@@ -52,6 +58,7 @@ int pipeline_execute(const token_t *tokens)
     for (int i = 0; i < num_cmds - 1; i++) {
         if (pipe(pipes[i]) < 0) {
             perror("cshell: pipe");
+            free(cmdline);
             return -1;
         }
     }
@@ -61,6 +68,7 @@ int pipeline_execute(const token_t *tokens)
         pids[i] = fork();
         if (pids[i] < 0) {
             perror("cshell: fork");
+            free(cmdline);
             return -1;
         }
 
@@ -68,6 +76,14 @@ int pipeline_execute(const token_t *tokens)
             // Redirect Stdin from previous pipe (if not first command)
             if (i > 0) {
                 dup2(pipes[i - 1][0], STDIN_FILENO);
+            } else if (background) {
+                // First stage of a backgrounded pipeline: no terminal
+                // input access (requirement D2.12).
+                int devnull = open("/dev/null", O_RDONLY);
+                if (devnull >= 0) {
+                    dup2(devnull, STDIN_FILENO);
+                    close(devnull);
+                }
             }
             // Redirect Stdout to current pipe (if not last command)
             if (i < num_cmds - 1) {
@@ -109,7 +125,14 @@ int pipeline_execute(const token_t *tokens)
         close(pipes[i][1]);
     }
 
-    // 5. Parent waits for all commands to complete before continuing
+    // 5. Either wait for the whole pipeline (foreground), or hand the
+    //    first stage off to background job tracking -- never both.
+    if (background) {
+        jobs_add(pids[0], cmdline); // requirement D2.13: report pid of first command
+        free(cmdline);
+        return 0;
+    }
+
     for (int i = 0; i < num_cmds; i++) {
         waitpid(pids[i], NULL, 0);
     }

@@ -1,17 +1,4 @@
 #include "sequence.h"
-#include "prompt.h"
-#include <pwd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <limits.h>
-#include <errno.h>
-
-/* NOTE: assumes token.h defines a TOK_SEMI token type for ';', matching
- * the existing TOK_PIPE / TOK_LT / TOK_GT / TOK_GTGT naming. If your
- * token.h uses a different name (e.g. TOK_SEMICOLON), update the two
- * references below accordingly. */
 
 #define MAX_SEGMENTS 64
 
@@ -25,14 +12,15 @@ int sequence_execute(const token_t *tokens, segment_executor_t run_segment)
     cut_t cuts[MAX_SEGMENTS];
     int num_cuts = 0;
     int last_status = 0;
-    int stop = 0; /* set once a segment fails; no further segments run */
+    int stop = 0; /* set once a foreground segment fails */
 
     token_t *seg_start = (token_t *)tokens;
     token_t *prev = NULL;
     token_t *t = (token_t *)tokens;
 
     while (t != NULL) {
-        if (t->type == TOK_SEMI) {
+        if (t->type == TOK_SEMI || t->type == TOK_AMP) {
+            int background = (t->type == TOK_AMP);
             token_t *after = t->next;
 
             if (prev != NULL) {
@@ -42,15 +30,17 @@ int sequence_execute(const token_t *tokens, segment_executor_t run_segment)
                     num_cuts++;
                 }
                 prev->next = NULL;
-                last_status = run_segment(seg_start);
+                last_status = run_segment(seg_start, background);
             } else {
-                /* empty segment before this ';' (leading/consecutive ';') */
-                last_status = run_segment(NULL);
+                /* empty segment before this separator (leading/consecutive) */
+                last_status = run_segment(NULL, background);
             }
 
-            if (last_status != 0) {
-                /* a command failed to execute: stop the sequence here and
-                 * do not run any of the remaining ';'-separated commands */
+            /* Only a failed *foreground* segment stops the sequence -- a
+             * background launch is always treated as "succeeded" here,
+             * since whatever it's running hasn't had a chance to fail
+             * yet (that's reported later, asynchronously, via jobs.c). */
+            if (!background && last_status != 0) {
                 stop = 1;
                 break;
             }
@@ -65,10 +55,11 @@ int sequence_execute(const token_t *tokens, segment_executor_t run_segment)
         t = t->next;
     }
 
-    /* run whatever follows the last ';' (or the whole list, if none found) --
-     * but only if nothing earlier in the sequence has already failed */
+    /* run whatever follows the last separator (or the whole list, if
+     * none found) as a foreground segment -- but only if nothing
+     * earlier in the sequence has already failed */
     if (!stop) {
-        last_status = run_segment(seg_start);
+        last_status = run_segment(seg_start, 0);
     }
 
     /* undo every temporary cut so the caller's token list is intact again */
