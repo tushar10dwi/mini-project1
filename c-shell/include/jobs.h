@@ -8,6 +8,7 @@
  * before any background job can possibly be launched. */
 void jobs_init(void);
 
+pid_t jobs_get_shell_pgid(void);
 /*
  * Registers pid as a new background job: assigns it the next
  * session-wide job number (monotonically increasing, never reused --
@@ -18,7 +19,7 @@ void jobs_init(void);
  * cmdline is copied internally; the caller keeps ownership of its own
  * copy and may (should) free it right after calling this.
  */
-void jobs_add(pid_t pid, const char *cmdline);
+void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdline);
 
 /*
  * Marks whether a foreground command is currently running (1) or not
@@ -37,6 +38,7 @@ void jobs_set_foreground(int active);
  */
 void jobs_flush_pending(void);
 
+void jobs_print_activities(void);
 /*
  * Reconstructs the human-readable text of a token segment (TOK_WORD
  * values, and '|', '<', '>', '>>' for the corresponding tokens, joined

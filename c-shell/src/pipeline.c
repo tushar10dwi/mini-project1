@@ -1,3 +1,7 @@
+/* Must come before any system header: without it, strict ISO C builds
+ * won't expose setpgid()/tcsetpgrp() from <unistd.h>. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "pipeline.h"
 #include "exec.h"
 #include "hop.h"
@@ -8,9 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <signal.h>
 
 #define MAX_CMDS 64
 #define MAX_ARGS 64
@@ -48,7 +52,7 @@ int pipeline_execute(const token_t *tokens, int background)
     num_cmds++;
 
     // If backgrounded, capture the pipeline's text now (before forking)
-    // for the eventual "<cmdline> with pid <pid> exited ..." message.
+    // for its eventual "<cmdline> with pid <pid> exited ..." message.
     char *cmdline = background ? jobs_stringify_tokens(tokens) : NULL;
 
     int pipes[MAX_CMDS][2];
@@ -73,17 +77,41 @@ int pipeline_execute(const token_t *tokens, int background)
         }
 
         if (pids[i] == 0) { // Child Process
+            // Join this pipeline's own process group (requirement E1.1:
+            // "using setpgid() ... also in every child before execve").
+            // The first command becomes its own group leader (pgid ==
+            // its own pid); every later stage joins that same group.
+            // Every non-pipe command counts as a group of one (E1.2).
+            if (i == 0) {
+                setpgid(0, 0);
+            } else {
+                setpgid(0, pids[0]);
+            }
+
+            // SIGTTIN/SIGTTOU are delivered to the whole process group,
+            // not just the one process that touched the terminal -- so
+            // without this split, a later pipeline stage (whose stdin
+            // is a pipe, never the terminal) would still be stopped as
+            // a bystander whenever an earlier stage's terminal read
+            // triggers the group-wide signal. Only the stage actually
+            // connected to the terminal on that side should keep the
+            // default (stoppable) disposition; every other stage must
+            // ignore it, so the same group-wide signal is simply a
+            // no-op for them and they keep running/blocking normally.
+            // (SIG_IGN survives execve(), so this also had to be reset
+            // at all -- otherwise everyone would inherit the shell's
+            // own ignore-disposition and never stop, per D2 #12/E1.)
+            int stdin_is_terminal  = (i == 0);
+            int stdout_is_terminal = (i == num_cmds - 1);
+            signal(SIGTTIN, stdin_is_terminal  ? SIG_DFL : SIG_IGN);
+            signal(SIGTTOU, stdout_is_terminal ? SIG_DFL : SIG_IGN);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+
             // Redirect Stdin from previous pipe (if not first command)
             if (i > 0) {
                 dup2(pipes[i - 1][0], STDIN_FILENO);
-            } else if (background) {
-                // First stage of a backgrounded pipeline: no terminal
-                // input access (requirement D2.12).
-                int devnull = open("/dev/null", O_RDONLY);
-                if (devnull >= 0) {
-                    dup2(devnull, STDIN_FILENO);
-                    close(devnull);
-                }
             }
             // Redirect Stdout to current pipe (if not last command)
             if (i < num_cmds - 1) {
@@ -117,6 +145,19 @@ int pipeline_execute(const token_t *tokens, int background)
                 exit(ret == 0 ? 0 : 127);
             }
         }
+
+        // Parent: join the child to the same group from this side too
+        // (the standard belt-and-suspenders pattern -- whichever of
+        // parent/child runs first "wins", closing the race where the
+        // child might exec, or the parent might tcsetpgrp/signal the
+        // group, before the other side has set it).
+        setpgid(pids[i], pids[0]);
+
+        if (i == 0 && !background) {
+            // Foreground: hand the terminal to this new group so it
+            // can read from stdin normally and receive ^C/^Z directly.
+            tcsetpgrp(STDIN_FILENO, pids[0]);
+        }
     }
 
     // 4. Parent shell must close every pipe file descriptor
@@ -125,17 +166,35 @@ int pipeline_execute(const token_t *tokens, int background)
         close(pipes[i][1]);
     }
 
-    // 5. Either wait for the whole pipeline (foreground), or hand the
-    //    first stage off to background job tracking -- never both.
+    // 5. Either hand the whole pipeline off to background job tracking,
+    //    or wait for it to finish in the foreground -- never both.
     if (background) {
-        jobs_add(pids[0], cmdline); // requirement D2.13: report pid of first command
+        char *names[MAX_CMDS];
+        for (int i = 0; i < num_cmds; i++) {
+            names[i] = cmd_argv[i][0] != NULL ? cmd_argv[i][0] : "";
+        }
+        jobs_add(pids, names, num_cmds, cmdline); // reports pids[0], requirement D2.13/E1.8
         free(cmdline);
         return 0;
     }
 
+    int last_status = 0;
     for (int i = 0; i < num_cmds; i++) {
-        waitpid(pids[i], NULL, 0);
+        int status;
+        waitpid(pids[i], &status, 0);
+        if (i == num_cmds - 1) {
+            // A pipeline's overall exit status follows its last stage,
+            // matching ordinary shell convention -- this is what lets
+            // sequence_execute() correctly detect a failed command and
+            // stop the rest of a ';'-sequence.
+            last_status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
     }
 
-    return 0;
+    // Reclaim the terminal for the shell now that the foreground job
+    // is done (jobs_init() already set SIGTTOU to be ignored here, so
+    // this call can't stop the shell itself).
+    tcsetpgrp(STDIN_FILENO, jobs_get_shell_pgid());
+
+    return last_status;
 }
