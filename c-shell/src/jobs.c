@@ -1,6 +1,3 @@
-/* Must come before any system header: without it, strict ISO C builds
- * (e.g. -std=c11/c23 without GNU extensions) won't expose struct
- * sigaction, SA_RESTART, tcsetpgrp(), or setpgid() from their headers. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "jobs.h"
@@ -12,57 +9,133 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* NOTE: assumes token.h's TOK_WORD / TOK_PIPE / TOK_LT / TOK_GT / TOK_GTGT
- * names, matching the rest of the codebase. */
-
 #define MAX_JOBS 256
-#define MAX_PROCS_PER_JOB 64   /* matches pipeline.c's MAX_CMDS */
+#define MAX_PROCS_PER_JOB 64   
 #define MAX_PENDING 256
 #define MAX_NAME_LEN 64
 #define MAX_CMDLINE_LEN 256
-/* Headroom above MAX_CMDLINE_LEN for the literal text around it (e.g.
- * " with pid " / " exited abnormally\n") plus a worst-case pid (up to
- * 11 digits). Without this margin, gcc's -Wformat-truncation can't
- * prove the snprintf() below never truncates and refuses to build
- * under -Werror. */
 #define MAX_MSG_LEN (MAX_CMDLINE_LEN + 64)
 
 typedef enum { PROC_RUNNING, PROC_STOPPED } proc_state_t;
 
 typedef struct {
-    int in_use;            /* still alive (not yet reaped as exited) */
+    int in_use;            
     pid_t pid;
     char name[MAX_NAME_LEN];
     proc_state_t state;
 } proc_t;
 
 typedef struct {
-    int in_use;             /* has at least one live process left */
+    int in_use;             
     int job_number;
-    pid_t pgid;              /* == procs[0].pid, by convention */
+    pid_t pgid;              
     char cmdline[MAX_CMDLINE_LEN];
     proc_t procs[MAX_PROCS_PER_JOB];
     int num_procs;
 } job_t;
 
-/* Append-only: job slots are never reused, so array order always
- * matches launch order (requirement E1.6 -- oldest first) without
- * needing to sort by job_number at print time. */
 static job_t jobs[MAX_JOBS];
 static int num_job_slots = 0;
-static int next_job_number = 1; /* ever-increasing; never reused (D2.4) */
+static int next_job_number = 1; 
 
-/* Messages queued while a foreground command is running (D2.11). */
 static char pending[MAX_PENDING][MAX_MSG_LEN];
 static int pending_count = 0;
 
 static volatile sig_atomic_t foreground_active = 0;
 
 static pid_t shell_pgid = 0;
-
+static pid_t foreground_pgid = 0; 
 pid_t jobs_get_shell_pgid(void)
 {
     return shell_pgid;
+}
+
+void jobs_give_terminal(pid_t pgid)
+{
+    foreground_pgid = pgid;
+    tcsetpgrp(STDIN_FILENO, pgid);
+}
+
+void jobs_reclaim_terminal(void)
+{
+    foreground_pgid = 0;
+    tcsetpgrp(STDIN_FILENO, shell_pgid);
+}
+
+void jobs_foreground_stopped(pid_t pgid)
+{
+    for (int i = 0; i < num_job_slots; i++) {
+        job_t *job = &jobs[i];
+        if (job->in_use && job->pgid == pgid) {
+            for (int p = 0; p < job->num_procs; p++) {
+                if (job->procs[p].pid == pgid) {
+                    job->procs[p].state = PROC_STOPPED;
+                }
+            }
+            printf("[%d] + Stopped   %s\n", job->job_number, job->cmdline);
+            fflush(stdout);
+            break;
+        }
+    }
+    jobs_reclaim_terminal();
+}
+
+int jobs_have_stopped(void)
+{
+    for (int i = 0; i < num_job_slots; i++) {
+        job_t *job = &jobs[i];
+        if (!job->in_use) continue;
+        for (int p = 0; p < job->num_procs; p++) {
+            if (job->procs[p].in_use && job->procs[p].state == PROC_STOPPED) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+void jobs_hangup_all(void)
+{
+    for (int i = 0; i < num_job_slots; i++) {
+        job_t *job = &jobs[i];
+        if (job->in_use) {
+            kill(-job->pgid, SIGHUP);
+        }
+    }
+}
+
+static volatile sig_atomic_t sigint_caught = 0;
+
+static void sigint_handler(int signo)
+{
+    (void)signo;
+    sigint_caught = 1;
+}
+
+int jobs_take_sigint(void)
+{
+    if (sigint_caught) {
+        sigint_caught = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static volatile sig_atomic_t sigtstp_caught = 0;
+
+static void sigtstp_handler(int signo)
+{
+    (void)signo;
+    sigtstp_caught = 1;
+}
+
+int jobs_take_sigtstp(void)
+{
+    if (sigtstp_caught) {
+        sigtstp_caught = 0;
+        return 1;
+    }
+    return 0;
 }
 
 void jobs_set_foreground(int active)
@@ -96,20 +169,12 @@ static void queue_or_print(const char *msg)
             pending[pending_count][MAX_MSG_LEN - 1] = '\0';
             pending_count++;
         }
-        /* queue full: message is dropped rather than doing unbounded
-         * work from within a signal handler */
     } else {
-        /* NOTE: printf/fflush aren't strictly POSIX async-signal-safe,
-         * but this is the conventional approach used in shell labs like
-         * this one. Swap for write() with a hand-built buffer if your
-         * grader requires strict async-signal-safety. */
         printf("%s", msg);
         fflush(stdout);
     }
 }
 
-/* Marks a whole job as no longer having any live processes if that's
- * now true, so jobs_print_activities() can skip it cheaply. */
 static void update_job_liveness(job_t *job)
 {
     for (int p = 0; p < job->num_procs; p++) {
@@ -127,29 +192,22 @@ static void sigchld_handler(int signo)
     int status;
     pid_t pid;
 
-    /* WNOHANG: never block the shell while reaping (D2.7).
-     * WUNTRACED: also notice a process being stopped (e.g. by SIGTTIN
-     * when a background group tries to read the terminal), not just
-     * terminated, so `activities` can report it as Stopped. */
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
         job_t *job = NULL;
         proc_t *proc = NULL;
         if (!find_proc_by_pid(pid, &job, &proc)) {
-            continue; /* not one of our tracked background processes */
+            continue; 
         }
 
         if (WIFSTOPPED(status)) {
             proc->state = PROC_STOPPED;
-            continue; /* still alive, just stopped -- no message (E1 only) */
+            continue; 
         }
 
-        /* terminated: exited or killed by a signal */
         proc->in_use = 0;
         update_job_liveness(job);
 
         if (pid == job->pgid) {
-            /* the group leader / first command in the pipeline is the
-             * one whose completion gets reported (D2.13) */
             char msg[MAX_MSG_LEN];
             if (WIFEXITED(status)) {
                 snprintf(msg, sizeof(msg), "%s with pid %d exited normally\n",
@@ -160,7 +218,6 @@ static void sigchld_handler(int signo)
             }
             queue_or_print(msg);
         }
-        /* other pipeline stages are reaped silently, with no message */
     }
 
     errno = saved_errno;
@@ -168,21 +225,13 @@ static void sigchld_handler(int signo)
 
 void jobs_init(void)
 {
-    /* Put the shell in its own process group (usually already true for
-     * an interactively-started shell, but harmless/idempotent if so;
-     * EPERM here typically just means it already is). */
     if (setpgid(0, 0) < 0 && errno != EPERM) {
         perror("cshell: setpgid");
     }
     shell_pgid = getpid();
 
-    /* Take control of the terminal for the shell's own group. */
     tcsetpgrp(STDIN_FILENO, shell_pgid);
 
-    /* Ignore SIGTTOU/SIGTTIN in the shell itself: otherwise, later
-     * calls to tcsetpgrp() (e.g. reclaiming the terminal right after a
-     * foreground job exits, when the shell is momentarily not the
-     * terminal's foreground group) would stop the shell itself. */
     signal(SIGTTOU, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
 
@@ -190,11 +239,25 @@ void jobs_init(void)
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART; /* don't let a blocking read() bail out with EINTR */
+    sa.sa_flags = SA_RESTART; 
     sigaction(SIGCHLD, &sa, NULL);
+
+    struct sigaction sa_int;
+    memset(&sa_int, 0, sizeof(sa_int));
+    sa_int.sa_handler = sigint_handler; /* sets the flag main.c checks */
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    sigaction(SIGINT, &sa_int, NULL);
+
+    struct sigaction sa_tstp;
+    memset(&sa_tstp, 0, sizeof(sa_tstp));
+    sa_tstp.sa_handler = sigtstp_handler; /* sets the flag main.c checks */
+    sigemptyset(&sa_tstp.sa_mask);
+    sa_tstp.sa_flags = 0;
+    sigaction(SIGTSTP, &sa_tstp, NULL);
 }
 
-void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdline)
+static void jobs_register(const pid_t *pids, char *const *names, int count, const char *cmdline)
 {
     if (count > MAX_PROCS_PER_JOB) {
         count = MAX_PROCS_PER_JOB; /* defensive; pipeline.c already caps this */
@@ -220,11 +283,18 @@ void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdl
             job->procs[i].name[MAX_NAME_LEN - 1] = '\0';
         }
     }
-    /* table full: the job still runs and gets reaped, just without
-     * activities/completion tracking -- better than crashing */
+}
 
-    printf("[%d] %d\n", job_number, (int)pids[0]);
+void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdline)
+{
+    jobs_register(pids, names, count, cmdline);
+    printf("[%d] %d\n", next_job_number - 1, (int)pids[0]);
     fflush(stdout);
+}
+
+void jobs_add_stopped(const pid_t *pids, char *const *names, int count, const char *cmdline)
+{
+    jobs_register(pids, names, count, cmdline);
 }
 
 void jobs_flush_pending(void)

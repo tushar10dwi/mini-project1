@@ -1,5 +1,3 @@
-/* Must come before any system header: without it, strict ISO C builds
- * won't expose setpgid()/tcsetpgrp() from <unistd.h>. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "pipeline.h"
@@ -51,9 +49,11 @@ int pipeline_execute(const token_t *tokens, int background)
     cmd_argv[num_cmds][cmd_argc[num_cmds]] = NULL;
     num_cmds++;
 
-    // If backgrounded, capture the pipeline's text now (before forking)
-    // for its eventual "<cmdline> with pid <pid> exited ..." message.
-    char *cmdline = background ? jobs_stringify_tokens(tokens) : NULL;
+    // Capture the pipeline's text now (before forking) -- needed for
+    // a background job's eventual completion message, and equally for
+    // a foreground job's "[N] + Stopped <cmdline>" message if it gets
+    // Ctrl-Z'd (E2 req 5).
+    char *cmdline = jobs_stringify_tokens(tokens);
 
     int pipes[MAX_CMDS][2];
     pid_t pids[MAX_CMDS];
@@ -156,7 +156,7 @@ int pipeline_execute(const token_t *tokens, int background)
         if (i == 0 && !background) {
             // Foreground: hand the terminal to this new group so it
             // can read from stdin normally and receive ^C/^Z directly.
-            tcsetpgrp(STDIN_FILENO, pids[0]);
+            jobs_give_terminal(pids[0]);
         }
     }
 
@@ -166,23 +166,31 @@ int pipeline_execute(const token_t *tokens, int background)
         close(pipes[i][1]);
     }
 
-    // 5. Either hand the whole pipeline off to background job tracking,
-    //    or wait for it to finish in the foreground -- never both.
+    // Names captured up front -- needed both for background tracking
+    // (below) and for registering the job if it gets Ctrl-Z'd while
+    // still in the foreground (E2 req 5).
+    char *names[MAX_CMDS];
+    for (int i = 0; i < num_cmds; i++) {
+        names[i] = cmd_argv[i][0] != NULL ? cmd_argv[i][0] : "";
+    }
+
     if (background) {
-        char *names[MAX_CMDS];
-        for (int i = 0; i < num_cmds; i++) {
-            names[i] = cmd_argv[i][0] != NULL ? cmd_argv[i][0] : "";
-        }
         jobs_add(pids, names, num_cmds, cmdline); // reports pids[0], requirement D2.13/E1.8
         free(cmdline);
         return 0;
     }
 
     int last_status = 0;
+    int stopped = 0;
     for (int i = 0; i < num_cmds; i++) {
         int status;
-        waitpid(pids[i], &status, 0);
-        if (i == num_cmds - 1) {
+        // WUNTRACED: notice Ctrl-Z stopping this stage, not just exit.
+        waitpid(pids[i], &status, WUNTRACED);
+        if (WIFSTOPPED(status)) {
+            stopped = 1;
+            continue;
+        }
+        if (i == num_cmds - 1 && !stopped) {
             // A pipeline's overall exit status follows its last stage,
             // matching ordinary shell convention -- this is what lets
             // sequence_execute() correctly detect a failed command and
@@ -191,10 +199,19 @@ int pipeline_execute(const token_t *tokens, int background)
         }
     }
 
-    // Reclaim the terminal for the shell now that the foreground job
-    // is done (jobs_init() already set SIGTTOU to be ignored here, so
-    // this call can't stop the shell itself).
-    tcsetpgrp(STDIN_FILENO, jobs_get_shell_pgid());
+    if (stopped) {
+        // Wasn't tracked as a job until now (only background jobs
+        // were) -- register it so `activities`, Ctrl-D's stopped-job
+        // check, and shell-exit SIGHUP can all see it.
+        jobs_add_stopped(pids, names, num_cmds, cmdline);
+        jobs_foreground_stopped(pids[0]); // marks Stopped, prints "[N] + Stopped ...", reclaims terminal
+    } else {
+        // Reclaim the terminal for the shell now that the foreground
+        // job is done (jobs_init() already set SIGTTOU to be ignored
+        // here, so this call can't stop the shell itself).
+        jobs_reclaim_terminal();
+    }
+    free(cmdline);
 
     return last_status;
 }
