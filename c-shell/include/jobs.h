@@ -25,6 +25,6 @@ void jobs_add_stopped(const pid_t *pids, char *const *names, int count, const ch
 int  jobs_take_sigint(void);
 int  jobs_take_sigtstp(void);
 void jobs_resume_execute(int argc, char **argv);
-
+void jobs_ping_execute(int argc, char **argv);
 
 #endif 
