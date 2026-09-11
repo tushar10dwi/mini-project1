@@ -38,7 +38,8 @@ static int run_segment(const token_t *seg, int background)
          strcmp(seg->value, "reveal") == 0 ||
          strcmp(seg->value, "peek") == 0 ||
          strcmp(seg->value, "locate") == 0 ||
-         strcmp(seg->value, "activities") == 0)) {
+         strcmp(seg->value, "activities") == 0 ||
+         strcmp(seg->value, "resume") == 0)) {
 
         char *argv[MAX_ARGS];
         int argc = build_argv(seg, argv, MAX_ARGS);
@@ -57,6 +58,9 @@ static int run_segment(const token_t *seg, int background)
         }
         else if (strcmp(argv[0], "locate") == 0) {
             locate_execute(argc, argv);
+        }
+        else if (strcmp(argv[0], "resume") == 0) {
+            jobs_resume_execute(argc, argv);
         }
         else {
             jobs_print_activities();
@@ -79,6 +83,7 @@ int main(void)
 {
     char line[INPUT_MAX_LEN + 1];
     int prev_was_eof = 0; 
+
     prompt_init();
     hop_init();
     jobs_init();

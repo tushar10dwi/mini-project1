@@ -4,48 +4,16 @@
 #include "token.h"
 #include <sys/types.h>
 
-/* Installs the SIGCHLD handler. Call this once, near the start of main(),
- * before any background job can possibly be launched. */
 void jobs_init(void);
 
 pid_t jobs_get_shell_pgid(void);
-/*
- * Registers pid as a new background job: assigns it the next
- * session-wide job number (monotonically increasing, never reused --
- * requirement D2.4), stores cmdline for later use in its completion
- * message, and immediately prints "[job_number] pid\n" (requirement
- * D2.3).
- *
- * cmdline is copied internally; the caller keeps ownership of its own
- * copy and may (should) free it right after calling this.
- */
 void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdline);
 
-/*
- * Marks whether a foreground command is currently running (1) or not
- * (0). While active, background-completion messages are queued
- * instead of printed immediately, so they never interleave with a
- * foreground command's own output (requirement D2.11). Call
- * jobs_flush_pending() once the foreground command finishes to print
- * anything that queued up while it ran.
- */
 void jobs_set_foreground(int active);
 
-/*
- * Prints and clears any background-completion messages that queued up
- * while a foreground command was running. Call this right before
- * showing the next prompt.
- */
 void jobs_flush_pending(void);
 
 void jobs_print_activities(void);
-/*
- * Reconstructs the human-readable text of a token segment (TOK_WORD
- * values, and '|', '<', '>', '>>' for the corresponding tokens, joined
- * by single spaces) for use in a background-completion message, e.g.
- * "sleep 5" or "sort file.txt | uniq -c". Returns a malloc'd string
- * the caller must free. Returns NULL only on allocation failure.
- */
 char *jobs_stringify_tokens(const token_t *tokens);
 
 void jobs_give_terminal(pid_t pgid);
@@ -56,6 +24,7 @@ void jobs_hangup_all(void);
 void jobs_add_stopped(const pid_t *pids, char *const *names, int count, const char *cmdline);
 int  jobs_take_sigint(void);
 int  jobs_take_sigtstp(void);
+void jobs_resume_execute(int argc, char **argv);
 
 
-#endif /* JOBS_H */
+#endif 

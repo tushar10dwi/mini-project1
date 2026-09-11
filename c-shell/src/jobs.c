@@ -1,5 +1,4 @@
 #define _POSIX_C_SOURCE 200809L
-
 #include "jobs.h"
 #include <errno.h>
 #include <signal.h>
@@ -9,8 +8,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+
 #define MAX_JOBS 256
-#define MAX_PROCS_PER_JOB 64   
+#define MAX_PROCS_PER_JOB 64   /* matches pipeline.c's MAX_CMDS */
 #define MAX_PENDING 256
 #define MAX_NAME_LEN 64
 #define MAX_CMDLINE_LEN 256
@@ -26,9 +26,9 @@ typedef struct {
 } proc_t;
 
 typedef struct {
-    int in_use;             
+    int in_use;            
     int job_number;
-    pid_t pgid;              
+    pid_t pgid;             
     char cmdline[MAX_CMDLINE_LEN];
     proc_t procs[MAX_PROCS_PER_JOB];
     int num_procs;
@@ -45,6 +45,7 @@ static volatile sig_atomic_t foreground_active = 0;
 
 static pid_t shell_pgid = 0;
 static pid_t foreground_pgid = 0; 
+
 pid_t jobs_get_shell_pgid(void)
 {
     return shell_pgid;
@@ -72,7 +73,7 @@ void jobs_foreground_stopped(pid_t pgid)
                     job->procs[p].state = PROC_STOPPED;
                 }
             }
-            printf("[%d] + Stopped   %s\n", job->job_number, job->cmdline);
+            printf("\n[%d] + Stopped   %s\n", job->job_number, job->cmdline);
             fflush(stdout);
             break;
         }
@@ -136,6 +137,52 @@ int jobs_take_sigtstp(void)
         return 1;
     }
     return 0;
+}
+
+static volatile sig_atomic_t alarm_fired = 0;
+
+static void sigalrm_handler(int signo)
+{
+    (void)signo;
+    alarm_fired = 1;
+}
+
+static job_t *find_job_by_number(int job_number)
+{
+    for (int i = 0; i < num_job_slots; i++) {
+        if (jobs[i].in_use && jobs[i].job_number == job_number) {
+            return &jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static int parse_job_arg(const char *arg, int *out_num)
+{
+    if (arg == NULL || arg[0] != '%' || arg[1] == '\0') {
+        return 0;
+    }
+    for (const char *q = arg + 1; *q != '\0'; q++) {
+        if (*q < '0' || *q > '9') {
+            return 0;
+        }
+    }
+    *out_num = atoi(arg + 1);
+    return 1;
+}
+
+static int parse_uint_arg(const char *arg, int *out_val)
+{
+    if (arg == NULL || *arg == '\0') {
+        return 0;
+    }
+    for (const char *q = arg; *q != '\0'; q++) {
+        if (*q < '0' || *q > '9') {
+            return 0;
+        }
+    }
+    *out_val = atoi(arg);
+    return 1;
 }
 
 void jobs_set_foreground(int active)
@@ -244,23 +291,30 @@ void jobs_init(void)
 
     struct sigaction sa_int;
     memset(&sa_int, 0, sizeof(sa_int));
-    sa_int.sa_handler = sigint_handler; /* sets the flag main.c checks */
+    sa_int.sa_handler = sigint_handler; 
     sigemptyset(&sa_int.sa_mask);
     sa_int.sa_flags = 0;
     sigaction(SIGINT, &sa_int, NULL);
 
     struct sigaction sa_tstp;
     memset(&sa_tstp, 0, sizeof(sa_tstp));
-    sa_tstp.sa_handler = sigtstp_handler; /* sets the flag main.c checks */
+    sa_tstp.sa_handler = sigtstp_handler; 
     sigemptyset(&sa_tstp.sa_mask);
     sa_tstp.sa_flags = 0;
     sigaction(SIGTSTP, &sa_tstp, NULL);
+
+    struct sigaction sa_alrm;
+    memset(&sa_alrm, 0, sizeof(sa_alrm));
+    sa_alrm.sa_handler = sigalrm_handler;
+    sigemptyset(&sa_alrm.sa_mask);
+    sa_alrm.sa_flags = 0; 
+    sigaction(SIGALRM, &sa_alrm, NULL);
 }
 
 static void jobs_register(const pid_t *pids, char *const *names, int count, const char *cmdline)
 {
     if (count > MAX_PROCS_PER_JOB) {
-        count = MAX_PROCS_PER_JOB; /* defensive; pipeline.c already caps this */
+        count = MAX_PROCS_PER_JOB;
     }
 
     int job_number = next_job_number++;
@@ -295,6 +349,112 @@ void jobs_add(const pid_t *pids, char *const *names, int count, const char *cmdl
 void jobs_add_stopped(const pid_t *pids, char *const *names, int count, const char *cmdline)
 {
     jobs_register(pids, names, count, cmdline);
+}
+
+void jobs_resume_execute(int argc, char **argv)
+{
+    int job_number;
+    if (argc < 3 || !parse_job_arg(argv[1], &job_number)) {
+        printf("resume: invalid syntax\n");
+        return;
+    }
+
+    int is_fg;
+    if (strcmp(argv[2], "fg") == 0) {
+        is_fg = 1;
+    } else if (strcmp(argv[2], "bg") == 0) {
+        is_fg = 0;
+    } else {
+        printf("resume: invalid syntax\n");
+        return;
+    }
+
+    int has_timeout = 0;
+    int timeout_secs = 0;
+    if (argc == 5) {
+        if (!is_fg || strcmp(argv[3], "--timeout") != 0 ||
+            !parse_uint_arg(argv[4], &timeout_secs)) {
+            printf("resume: invalid syntax\n");
+            return;
+        }
+        has_timeout = 1;
+    } else if (argc != 3) {
+        printf("resume: invalid syntax\n");
+        return;
+    }
+
+    job_t *job = find_job_by_number(job_number);
+    if (job == NULL) {
+        printf("resume: no such job\n");
+        return;
+    }
+
+    /* req 2 */
+    kill(-job->pgid, SIGCONT);
+    for (int p = 0; p < job->num_procs; p++) {
+        if (job->procs[p].in_use) {
+            job->procs[p].state = PROC_RUNNING;
+        }
+    }
+
+    if (!is_fg) {
+        printf("[%d] + Running   %s\n", job->job_number, job->cmdline);
+        fflush(stdout);
+        return;
+    }
+
+    printf("%s\n", job->cmdline);
+    fflush(stdout);
+
+    jobs_give_terminal(job->pgid); 
+
+    if (has_timeout) {
+        alarm_fired = 0;
+        alarm(timeout_secs); 
+    }
+
+    int status;
+    pid_t w;
+    for (;;) {
+        w = waitpid(job->pgid, &status, WUNTRACED); 
+        if (w < 0 && errno == EINTR) {
+            if (has_timeout && alarm_fired) {
+                break;
+            }
+            continue; 
+        }
+        break;
+    }
+
+    if (has_timeout) {
+        alarm(0); 
+    }
+
+    if (has_timeout && alarm_fired) {
+        alarm_fired = 0;
+        kill(-job->pgid, SIGTERM);
+        printf("resume: job timed out\n");
+        fflush(stdout);
+        job->in_use = 0;
+        for (int p = 0; p < job->num_procs; p++) {
+            job->procs[p].in_use = 0;
+        }
+        jobs_reclaim_terminal();
+        return;
+    }
+
+    if (w > 0 && WIFSTOPPED(status)) {
+        jobs_foreground_stopped(job->pgid); 
+        return;
+    }
+
+    for (int p = 0; p < job->num_procs; p++) {
+        if (job->procs[p].pid == job->pgid) {
+            job->procs[p].in_use = 0;
+        }
+    }
+    update_job_liveness(job);
+    jobs_reclaim_terminal(); 
 }
 
 void jobs_flush_pending(void)
@@ -366,7 +526,7 @@ char *jobs_stringify_tokens(const token_t *tokens)
         }
 
         size_t piece_len = strlen(piece);
-        size_t need = len + piece_len + 2; /* +1 separating space, +1 NUL */
+        size_t need = len + piece_len + 2; 
         if (need > cap) {
             while (cap < need) {
                 cap *= 2;
