@@ -3,9 +3,9 @@
 > C shell:
 
 Run the following commands in the shell:  
-`cd c-shell  
-make all  
-./shell.out`  
+`cd c-shell`  
+`make all`  
+`./shell.out`  
 
 > xv6 MLFQ:  
 
