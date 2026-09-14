@@ -89,6 +89,18 @@ struct proc {
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
 
+  // Scheduler-comparison bookkeeping (2.2/2.3.3). Populated the same
+  // way regardless of which SCHEDULER build this is, so runs under
+  // RR/FIFO/MLFQ are directly comparable. Like kstack/sz below,
+  // these are only ever touched by the process's own execution
+  // context (or by code that already holds p->lock for other
+  // reasons, e.g. kexit()), so no separate lock is required.
+  uint ctime;           // tick at which the process was created
+  uint first_run_tick;  // tick at which it was first scheduled to run
+  uint etime;            // tick at which it exited
+  uint runtime_ticks;   // total timer ticks actually spent RUNNING
+  int has_run;          // set once first_run_tick has been stamped
+
   // wait_lock must be held when using this:
   struct proc *parent; // Parent process
 
@@ -101,4 +113,13 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+#ifdef SCHEDULER_MLFQ
+  // MLFQ scheduler bookkeeping. p->lock must be held when using these
+  // (mirrors the state/chan/killed/xstate/pid group above).
+  int mlfq_queue;   // current priority queue: 0 (highest) .. NMLFQ-1 (lowest)
+  int mlfq_ticks;   // timer ticks consumed within the current time slice
+  uint64 mlfq_seq;  // enqueue sequence number; lower = closer to queue head,
+                     // used to preserve FIFO order within a queue
+#endif
 };

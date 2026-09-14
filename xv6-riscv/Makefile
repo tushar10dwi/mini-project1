@@ -76,6 +76,21 @@ CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
 CFLAGS += -I.
 CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
 
+# Scheduler selection, chosen at compile time. Default (unset) is the
+# original round-robin scheduler. SCHEDULER=MLFQ builds the
+# Multi-Level Feedback Queue scheduler; SCHEDULER=FIFO builds the
+# smallest-pid-first (first-come-first-served) scheduler.
+#   make clean; make qemu                  # round-robin (default)
+#   make clean; make qemu SCHEDULER=MLFQ   # MLFQ
+#   make clean; make qemu SCHEDULER=FIFO   # FIFO / FCFS
+SCHEDULER ?=
+
+ifeq ($(SCHEDULER),MLFQ)
+CFLAGS += -DSCHEDULER_MLFQ
+else ifeq ($(SCHEDULER),FIFO)
+CFLAGS += -DSCHEDULER_FIFO
+endif
+
 # Disable PIE when possible (for Ubuntu 16.10 toolchain)
 ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
 CFLAGS += -fno-pie -no-pie
@@ -146,6 +161,7 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_sync\
+	$U/_schedulertest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

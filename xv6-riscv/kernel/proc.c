@@ -26,6 +26,128 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+#ifdef SCHEDULER_MLFQ
+// ---------------------------------------------------------------------
+// Multi-Level Feedback Queue scheduler.
+//
+// Rather than maintaining explicit per-queue linked lists, each proc
+// carries its own mlfq_queue (priority level) and mlfq_seq (an
+// insertion counter). Picking the "front of the highest-priority
+// non-empty queue" is then just: scan every RUNNABLE proc, keep the
+// one with the lowest mlfq_queue, breaking ties by the lowest
+// mlfq_seq (the one that got there first). Re-enqueuing at the
+// "tail" of a queue is just handing out a fresh, larger mlfq_seq.
+// This keeps the same array-scan style already used by scheduler(),
+// wakeup(), etc. elsewhere in this file.
+// ---------------------------------------------------------------------
+
+#define NMLFQ 4          // number of priority queues, 0 (highest) .. 3 (lowest)
+#define BOOST_INTERVAL 48 // system ticks between priority boosts
+
+// Time slice (in timer ticks) for each queue.
+static const int mlfq_slice[NMLFQ] = {1, 4, 8, 16};
+
+// Protects mlfq_seq_counter only. Always acquired after, and released
+// before, any p->lock it's nested under -- never the other way around.
+struct spinlock mlfqlock;
+
+static uint64 mlfq_seq_counter = 0;
+
+// (Re-)place p at the tail of `queue`, resetting its time-slice
+// counter. Caller must already hold p->lock.
+static void
+mlfq_enqueue_locked(struct proc *p, int queue)
+{
+  p->mlfq_queue = queue;
+  p->mlfq_ticks = 0;
+  acquire(&mlfqlock);
+  p->mlfq_seq = mlfq_seq_counter++;
+  release(&mlfqlock);
+}
+
+// Is any RUNNABLE process currently sitting in a strictly
+// higher-priority queue (lower queue number) than `queue`?
+static int
+mlfq_higher_priority_runnable(int queue)
+{
+  struct proc *p;
+  int found = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE && p->mlfq_queue < queue)
+      found = 1;
+    release(&p->lock);
+    if (found)
+      break;
+  }
+  return found;
+}
+
+// Called once per timer tick that lands while p is RUNNING.
+// Advances p's slice; if the slice is exhausted, demotes p to the
+// next lower queue (staying in queue NMLFQ-1 if already there) and
+// yields. Otherwise, yields anyway if a higher-priority process has
+// since become runnable, so preemption happens at this tick
+// boundary rather than waiting for p's own slice to run out.
+void
+mlfq_timer_tick(struct proc *p)
+{
+  int slice_done;
+
+  acquire(&p->lock);
+  p->mlfq_ticks++;
+  slice_done = (p->mlfq_ticks >= mlfq_slice[p->mlfq_queue]);
+  if (slice_done) {
+    int nq = p->mlfq_queue + 1;
+    if (nq >= NMLFQ)
+      nq = NMLFQ - 1;
+    mlfq_enqueue_locked(p, nq);
+  }
+  int cur_queue = p->mlfq_queue;
+  release(&p->lock);
+
+  // One line per tick a process actually gets to run, for the
+  // timeline/scatter plot in the MLFQ analysis writeup. Only fires
+  // while some process is RUNNING (kerneltrap already guards on
+  // myproc() != 0), so an idle system stays quiet. Grep for
+  // "MLFQLOG" (or filter by tick/pid in the plotting script) to pull
+  // this out of a captured qemu console log.
+  {
+    extern uint ticks;
+    printk("MLFQLOG %d %d %d\n", (int)ticks, p->pid, cur_queue);
+  }
+
+  if (slice_done || mlfq_higher_priority_runnable(cur_queue))
+    yield();
+}
+
+// Move every process in the system back to queue 0 (anti-starvation).
+static void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED)
+      mlfq_enqueue_locked(p, 0);
+    release(&p->lock);
+  }
+}
+
+// Called from clockintr() (cpu 0 only, once per system tick) with the
+// just-incremented global tick count. Boosts every BOOST_INTERVAL
+// ticks. Kept here, rather than duplicated in trap.c, so all MLFQ
+// policy lives in one file.
+void
+mlfq_boost_if_due(uint now)
+{
+  if (now % BOOST_INTERVAL == 0)
+    mlfq_boost();
+}
+#endif // SCHEDULER_MLFQ
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -51,6 +173,9 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+#ifdef SCHEDULER_MLFQ
+  initlock(&mlfqlock, "mlfq");
+#endif
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -124,6 +249,14 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  {
+    extern uint ticks;
+    p->ctime = ticks;
+  }
+  p->first_run_tick = 0;
+  p->etime = 0;
+  p->runtime_ticks = 0;
+  p->has_run = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -145,6 +278,11 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+#ifdef SCHEDULER_MLFQ
+  // New process placement: pushed to the tail of queue 0.
+  mlfq_enqueue_locked(p, 0);
+#endif
 
   return p;
 }
@@ -168,6 +306,16 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->ctime = 0;
+  p->first_run_tick = 0;
+  p->etime = 0;
+  p->runtime_ticks = 0;
+  p->has_run = 0;
+#ifdef SCHEDULER_MLFQ
+  p->mlfq_queue = 0;
+  p->mlfq_ticks = 0;
+  p->mlfq_seq = 0;
+#endif
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -356,6 +504,15 @@ kexit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  {
+    extern uint ticks;
+    p->etime = ticks;
+    // One line per exiting process, for the FIFO/RR/MLFQ turnaround
+    // /waiting/response-time comparison in 2.2/2.3.3. Emitted the
+    // same way regardless of which SCHEDULER build this is.
+    printk("PROCSTATS pid=%d ctime=%d first_run=%d etime=%d runtime=%d\n",
+           p->pid, p->ctime, p->first_run_tick, p->etime, p->runtime_ticks);
+  }
 
   release(&wait_lock);
 
@@ -418,6 +575,125 @@ kwait(uint64 addr)
   }
 }
 
+// Stamp first_run_tick the first time any scheduler variant actually
+// dispatches this process. Caller must hold p->lock. Shared across
+// RR/FIFO/MLFQ so Response Time (first_run - ctime) is computed the
+// same way regardless of which is compiled in.
+static void
+mark_first_run(struct proc *p)
+{
+  if (!p->has_run) {
+    extern uint ticks;
+    p->has_run = 1;
+    p->first_run_tick = ticks;
+  }
+}
+
+#ifdef SCHEDULER_MLFQ
+// MLFQ variant of scheduler(): strict priority selection among
+// RUNNABLE procs (lowest mlfq_queue wins), FIFO within a queue
+// (lowest mlfq_seq wins). Rule 3 (process completion) needs no
+// special handling here -- a ZOMBIE proc is simply never RUNNABLE,
+// so it naturally falls out of consideration.
+static void
+scheduler_mlfq(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for (;;) {
+    intr_on();
+    intr_off();
+
+    struct proc *best = 0;
+    int best_queue = NMLFQ;
+    uint64 best_seq = 0;
+
+    // Pass 1: find the best RUNNABLE candidate. Each proc's lock is
+    // held only long enough to read its queue/seq, same pattern
+    // used by wakeup() and kkill() elsewhere in this file.
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE &&
+          (best == 0 || p->mlfq_queue < best_queue ||
+           (p->mlfq_queue == best_queue && p->mlfq_seq < best_seq))) {
+        best = p;
+        best_queue = p->mlfq_queue;
+        best_seq = p->mlfq_seq;
+      }
+      release(&p->lock);
+    }
+
+    if (best != 0) {
+      // Pass 2: re-acquire and re-check -- another CPU may have
+      // already taken it, or its state may have changed, between
+      // pass 1 and here.
+      acquire(&best->lock);
+      if (best->state == RUNNABLE) {
+        mark_first_run(best);
+        best->state = RUNNING;
+        c->proc = best;
+        swtch(&c->context, &best->context);
+        mycpu()->intena = 0;
+        c->proc = 0;
+      }
+      release(&best->lock);
+    } else {
+      // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+    }
+  }
+}
+#endif // SCHEDULER_MLFQ
+
+#ifdef SCHEDULER_FIFO
+// First-Come-First-Served (mini-project 2.2 DIY task): always run the
+// RUNNABLE process with the smallest pid. xv6 hands out pids in
+// increasing order as processes are created (see allocpid()), so
+// smallest pid == earliest arrival.
+static void
+scheduler_fifo(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for (;;) {
+    intr_on();
+    intr_off();
+
+    struct proc *best = 0;
+    int best_pid = 0;
+
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && (best == 0 || p->pid < best_pid)) {
+        best = p;
+        best_pid = p->pid;
+      }
+      release(&p->lock);
+    }
+
+    if (best != 0) {
+      acquire(&best->lock);
+      if (best->state == RUNNABLE) {
+        mark_first_run(best);
+        best->state = RUNNING;
+        c->proc = best;
+        swtch(&c->context, &best->context);
+        mycpu()->intena = 0;
+        c->proc = 0;
+      }
+      release(&best->lock);
+    } else {
+      asm volatile("wfi");
+    }
+  }
+}
+#endif // SCHEDULER_FIFO
+
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -428,6 +704,13 @@ kwait(uint64 addr)
 void
 scheduler(void)
 {
+#ifdef SCHEDULER_MLFQ
+  scheduler_mlfq();
+  panic("scheduler_mlfq returned"); // scheduler_mlfq() never returns
+#elif defined(SCHEDULER_FIFO)
+  scheduler_fifo();
+  panic("scheduler_fifo returned"); // scheduler_fifo() never returns
+#else
   struct proc *p;
   struct cpu *c = mycpu();
 
@@ -448,6 +731,7 @@ scheduler(void)
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
+        mark_first_run(p);
         p->state = RUNNING;
         c->proc = p;
         swtch(&c->context, &p->context);
@@ -467,6 +751,7 @@ scheduler(void)
       asm volatile("wfi");
     }
   }
+#endif // SCHEDULER_MLFQ
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -589,6 +874,11 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+#ifdef SCHEDULER_MLFQ
+        // Voluntary yield: re-enter at the tail of the SAME queue
+        // (priority unchanged), with a fresh time slice.
+        mlfq_enqueue_locked(p, p->mlfq_queue);
+#endif
       }
     }
     release(&p->lock);
@@ -686,6 +976,9 @@ procdump(void)
   };
   struct proc *p;
   char *state;
+#ifdef SCHEDULER_MLFQ
+  extern uint ticks; // global tick count, defined in trap.c
+#endif
 
   printk("\n");
   for (p = proc; p < &proc[NPROC]; p++) {
@@ -696,6 +989,10 @@ procdump(void)
     else
       state = "???";
     printk("%d %s %s", p->pid, state, p->name);
+#ifdef SCHEDULER_MLFQ
+    printk(" q=%d slice=%d/%d since_boost=%d", p->mlfq_queue, p->mlfq_ticks,
+           mlfq_slice[p->mlfq_queue], (int)(ticks % BOOST_INTERVAL));
+#endif
     printk("\n");
   }
 }
