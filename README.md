@@ -1,12 +1,12 @@
 1) How to run the code:
 
-# C shell:
+> C shell:
 Run the following commands in the shell:
 cd c-shell
 make all
 ./shell.out
 
-# xv6 MLFQ:
+> xv6 MLFQ:
 
 Just run the shell script:
 bash run_tests.sh
