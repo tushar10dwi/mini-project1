@@ -3,14 +3,14 @@
 > C shell:
 
 Run the following commands in the shell:  
-cd c-shell  
+`cd c-shell  
 make all  
-./shell.out  
+./shell.out`  
 
 > xv6 MLFQ:  
 
 Just run the shell script:  
-bash run_tests.sh  
+`bash run_tests.sh`  
 
 2) Folder Structure:
 
